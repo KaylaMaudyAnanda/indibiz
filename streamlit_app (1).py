@@ -10,6 +10,8 @@ Alur: Pengumpulan Data -> Preprocessing (Data Cleaning) -> Penentuan Periode ->
       Pemilihan Model Terbaik -> Peramalan ke Depan
 """
 
+import os
+import io
 import tempfile
 
 import numpy as np
@@ -322,6 +324,21 @@ def uji_stasioneritas(bulanan):
     return stat, pval, kesimpulan
 
 
+def buat_plot_timeseries(bulanan, n_train):
+    """Time series plot sederhana data aktual + garis batas train/test (untuk tab Statistik)."""
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    ax.plot(range(1, len(bulanan) + 1), bulanan.values, color="#CC0000", linewidth=2,
+            marker="o", markersize=4)
+    ax.axvline(x=n_train + 0.5, color="gray", linestyle=":", linewidth=1.3, label="Batas Train/Test")
+    ax.set_title("Time Series Plot — Jumlah Pemasangan WiFi IndiBiz", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Periode (Bulan ke-)")
+    ax.set_ylabel("Jumlah Pemasangan")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+
 def buat_plot(X, Ft_plot, n, n_train, tgl_forecast, hasil_forecast, method_short, mae, rmse, mape):
     fig, ax = plt.subplots(figsize=(12, 5.5))
 
@@ -449,37 +466,218 @@ def export_excel(hasil, n_train, n_test):
         return f.read()
 
 
+
 # ──────────────────────────────────────────────────────────────────────────
-# 5. ANTARMUKA STREAMLIT
+# 5. HELPER TAMPILAN (CSS, kartu statistik, kartu metrik besar)
 # ──────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Peramalan WiFi IndiBiz", layout="wide")
+WARNA_KATEGORI = {
+    "Sangat Baik": "#1E8E3E",
+    "Baik": "#1A73E8",
+    "Cukup Baik": "#F9A825",
+    "Buruk": "#CC0000",
+}
 
-st.title("📡 Peramalan Jumlah Pemasangan WiFi IndiBiz")
-st.markdown(
-    "Upload file **Data Mentah (.xlsx)** dengan kolom `TGL_PS` (format tanggal `YYYYMMDD`), "
-    "pilih metode & parameter di sidebar, lalu klik **Jalankan Analisis**."
-)
+CUSTOM_CSS = """
+<style>
+.stat-card {
+    background-color: #F5F5F5;
+    border-left: 5px solid #CC0000;
+    border-radius: 8px;
+    padding: 14px 18px;
+    text-align: center;
+}
+.stat-card .label { font-size: 13px; color: #666666; margin-bottom: 4px; }
+.stat-card .value { font-size: 22px; font-weight: 700; color: #333333; }
 
+.metric-card {
+    border-radius: 10px;
+    padding: 18px 10px;
+    text-align: center;
+    color: white;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+}
+.metric-card .metric-label { font-size: 14px; opacity: 0.9; margin-bottom: 6px; }
+.metric-card .metric-value { font-size: 30px; font-weight: 800; line-height: 1.1; }
+.metric-card .metric-sub { font-size: 12px; margin-top: 6px; opacity: 0.9; }
+
+.param-card {
+    background-color: #FFFFFF;
+    border: 1px solid #E0E0E0;
+    border-radius: 8px;
+    padding: 10px 14px;
+    text-align: center;
+}
+.param-card .label { font-size: 12px; color: #888888; }
+.param-card .value { font-size: 18px; font-weight: 700; color: #CC0000; }
+</style>
+"""
+
+
+def render_stat_cards(cols, items):
+    """items: list of (label, value) -> ditampilkan sebagai kartu statistik sederhana."""
+    for col, (label, value) in zip(cols, items):
+        col.markdown(
+            f'<div class="stat-card"><div class="label">{label}</div>'
+            f'<div class="value">{value}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_param_cards(cols, items):
+    for col, (label, value) in zip(cols, items):
+        col.markdown(
+            f'<div class="param-card"><div class="label">{label}</div>'
+            f'<div class="value">{value}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_metric_cards_besar(mae, rmse, mape):
+    kategori = kategori_mape(mape)
+    warna = WARNA_KATEGORI.get(kategori, "#CC0000")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown(
+            f'<div class="metric-card" style="background-color:#333333;">'
+            f'<div class="metric-label">MAE</div>'
+            f'<div class="metric-value">{mae:.2f}</div></div>',
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.markdown(
+            f'<div class="metric-card" style="background-color:#555555;">'
+            f'<div class="metric-label">RMSE</div>'
+            f'<div class="metric-value">{rmse:.2f}</div></div>',
+            unsafe_allow_html=True,
+        )
+    with col3:
+        st.markdown(
+            f'<div class="metric-card" style="background-color:{warna};">'
+            f'<div class="metric-label">MAPE</div>'
+            f'<div class="metric-value">{mape:.2f}%</div>'
+            f'<div class="metric-sub">{kategori}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+def baca_preview(file_obj):
+    """Baca cepat file untuk preview sebelum analisis dijalankan (tanpa cleaning penuh)."""
+    file_obj.seek(0)
+    df = pd.read_excel(file_obj)
+    file_obj.seek(0)
+    if "TGL_PS" not in df.columns:
+        return None
+    df_tgl = df.copy()
+    df_tgl["TGL_PS"] = pd.to_datetime(df_tgl["TGL_PS"], format="%Y%m%d", errors="coerce")
+    total_data = len(df)
+    rentang = f"{df_tgl['TGL_PS'].min().strftime('%b %Y')} – {df_tgl['TGL_PS'].max().strftime('%b %Y')}"
+    n_bulan = df_tgl["TGL_PS"].dt.to_period("M").nunique()
+    rata_rata = total_data / n_bulan if n_bulan else 0
+    return {
+        "total_data": total_data,
+        "rentang": rentang,
+        "rata_rata": rata_rata,
+        "df_head": df.head(5),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 6. ANTARMUKA STREAMLIT
+# ──────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="Peramalan WiFi IndiBiz", page_icon="📡", layout="wide")
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+if "hasil" not in st.session_state:
+    st.session_state.hasil = None
+    st.session_state.catatan_cleaning = None
+    st.session_state.info_periode = None
+    st.session_state.info_split = None
+    st.session_state.adf_info = None
+    st.session_state.n_train = None
+    st.session_state.n_test = None
+    st.session_state.n_forecast = None
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
+# ── Sidebar ──────────────────────────────────────────────────────────────
 with st.sidebar:
+    logo_path = "assets/logo.png"
+    if os.path.exists(logo_path):
+        st.image(logo_path, width='stretch')
+    else:
+        st.markdown(
+            '<div style="text-align:center; padding: 6px 0 14px 0;">'
+            '<span style="font-size:34px;">📡</span><br>'
+            '<span style="font-size:16px; font-weight:700; color:#CC0000;">'
+            'PT Telkom Indonesia</span><br>'
+            '<span style="font-size:12px; color:#666;">Witel Kalimantan Barat</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    st.divider()
+
     st.header("⚙️ Pengaturan")
-    uploaded_file = st.file_uploader("Upload Data Mentah (.xlsx)", type=["xlsx"])
+    uploaded_file = st.file_uploader(
+        "Upload Data Mentah (.xlsx)", type=["xlsx"],
+        key=f"file_uploader_{st.session_state.uploader_key}",
+    )
+    st.caption("ℹ️ File harus punya kolom **TGL_PS** berformat `YYYYMMDD`.")
 
     metode = st.selectbox(
         "Metode Peramalan",
         ["Holt's Double Exponential Smoothing (tanpa musiman)", "Holt-Winters (dengan musiman)"],
-        help=(
-            "Holt's DES: cuma level + tren, cocok kalau polanya naik/turun umum tanpa "
-            "pengulangan bulanan yang jelas.\n\n"
-            "Holt-Winters: level + tren + musiman, cocok kalau ada pola berulang tiap tahun "
-            "di bulan yang sama — tapi butuh data minimal 2 tahun penuh untuk hasil stabil."
-        ),
+    )
+    st.caption(
+        "ℹ️ **Holt's DES**: cocok untuk pola naik/turun umum tanpa musiman jelas.\n\n"
+        "ℹ️ **Holt-Winters**: cocok kalau ada pola berulang tiap tahun, minimal butuh data 2 tahun penuh."
     )
 
     test_ratio = st.slider("Proporsi Data Testing", 0.10, 0.30, 0.20, 0.05)
-    n_forecast = st.slider("Horizon Peramalan (bulan ke depan)", 1, 12, 6, 1)
-    run_btn = st.button("🚀 Jalankan Analisis", type="primary", use_container_width=True)
+    st.caption("ℹ️ Disarankan **0.2 (20%)** — porsi data test untuk validasi out-of-sample.")
 
+    n_forecast = st.slider("Horizon Peramalan (bulan ke depan)", 1, 12, 6, 1)
+    st.caption("ℹ️ Berapa bulan ke depan yang ingin diramalkan.")
+
+    col_run, col_reset = st.columns(2)
+    run_btn = col_run.button("🚀 Jalankan", type="primary", width='stretch')
+    reset_btn = col_reset.button("🔄 Reset", width='stretch')
+
+if reset_btn:
+    next_uploader_key = st.session_state.get("uploader_key", 0) + 1
+    st.session_state.clear()
+    st.session_state.uploader_key = next_uploader_key
+    st.rerun()
+
+# ── Header utama ─────────────────────────────────────────────────────────
+st.title("📡 Peramalan Jumlah Pemasangan WiFi IndiBiz")
+st.markdown(
+    "Dashboard peramalan otomatis: pembersihan data → pembagian train-test → optimasi "
+    "parameter → evaluasi (MAE, RMSE, MAPE) → peramalan ke depan."
+)
+
+# ── Preview sebelum analisis dijalankan ─────────────────────────────────
+if uploaded_file is not None and not run_btn and st.session_state.hasil is None:
+    preview = baca_preview(uploaded_file)
+    if preview is None:
+        st.error("File tidak punya kolom 'TGL_PS'. Pastikan format file sudah sesuai.")
+    else:
+        st.subheader("👀 Pratinjau Data")
+        c1, c2, c3 = st.columns(3)
+        render_stat_cards(
+            [c1, c2, c3],
+            [
+                ("📊 Total Data", f"{preview['total_data']:,}"),
+                ("📅 Rentang Waktu", preview["rentang"]),
+                ("📈 Rata-rata/bulan", f"{preview['rata_rata']:.0f}"),
+            ],
+        )
+        st.markdown("###### 5 baris pertama data")
+        st.dataframe(preview["df_head"], width='stretch', hide_index=True)
+        st.info("👈 Atur parameter di sidebar, lalu klik **Jalankan** untuk mulai analisis.")
+
+# ── Jalankan analisis ────────────────────────────────────────────────────
 if run_btn:
     if uploaded_file is None:
         st.error("Silakan upload file Data Mentah (.xlsx) terlebih dahulu.")
@@ -512,73 +710,130 @@ if run_btn:
             st.stop()
 
     with st.spinner("Membuat visualisasi..."):
-        fig = buat_plot(hasil["X"], hasil["Ft_plot"], hasil["n"], len(train),
-                         hasil["tgl_forecast"], hasil["hasil_forecast"],
-                         hasil["method_short"], hasil["mae"], hasil["rmse"], hasil["mape"])
+        fig_ts = buat_plot_timeseries(bulanan, len(train))
+        fig_hasil = buat_plot(hasil["X"], hasil["Ft_plot"], hasil["n"], len(train),
+                               hasil["tgl_forecast"], hasil["hasil_forecast"],
+                               hasil["method_short"], hasil["mae"], hasil["rmse"], hasil["mape"])
 
     with st.spinner("Menyusun file Excel..."):
         excel_bytes = export_excel(hasil, len(train), len(test))
 
-    st.success(f"Analisis selesai — Metode: {hasil['method_name']}")
+    # simpan semua ke session_state supaya persist walau ganti tab
+    st.session_state.hasil = hasil
+    st.session_state.catatan_cleaning = catatan_cleaning
+    st.session_state.info_periode = info_periode
+    st.session_state.info_split = info_split
+    st.session_state.adf_info = (adf_stat, adf_pval, adf_kesimpulan)
+    st.session_state.bulanan = bulanan
+    st.session_state.n_train = len(train)
+    st.session_state.n_test = len(test)
+    st.session_state.n_forecast = n_forecast
+    st.session_state.fig_ts = fig_ts
+    st.session_state.fig_hasil = fig_hasil
+    st.session_state.excel_bytes = excel_bytes
 
-    st.subheader("🧹 Preprocessing")
-    for c in catatan_cleaning:
-        st.markdown(f"- {c}")
+# ── Tampilkan hasil (persist dari session_state) ─────────────────────────
+if st.session_state.hasil is not None:
+    hasil = st.session_state.hasil
+    st.success(f"✅ Analisis selesai — Metode: {hasil['method_name']}")
 
-    st.subheader("🗓️ Periode & Pembagian Data")
-    st.markdown(f"- {info_periode}")
-    st.markdown(f"- {info_split}")
+    st.markdown("#### 🏆 Metrik Evaluasi Model (Data Test)")
+    render_metric_cards_besar(hasil["mae"], hasil["rmse"], hasil["mape"])
 
-    st.subheader("🔍 Uji Stasioneritas (ADF)")
-    st.markdown(f"ADF statistic = `{adf_stat:.4f}` | p-value = `{adf_pval:.4f}` — {adf_kesimpulan}")
+    st.markdown("")
+    param_cols = st.columns(len(hasil["params_info"]))
+    render_param_cards(param_cols, list(hasil["params_info"].items()))
 
-    st.subheader(f"🏆 Model Terbaik — {hasil['method_name']}")
-    cols = st.columns(len(hasil["params_info"]) + 3)
-    for col, (k, v) in zip(cols, hasil["params_info"].items()):
-        col.metric(k, v)
-    cols[-3].metric("MAE (test)", f"{hasil['mae']:.2f}")
-    cols[-2].metric("RMSE (test)", f"{hasil['rmse']:.2f}")
-    cols[-1].metric("MAPE (test)", f"{hasil['mape']:.2f}%")
-    st.caption(f"Kategori akurasi: **{kategori_mape(hasil['mape'])}**")
-
-    if "tabel_kandidat" in hasil:
-        with st.expander("Lihat perbandingan 4 kombinasi Holt-Winters yang dicoba"):
-            st.dataframe(hasil["tabel_kandidat"], use_container_width=True, hide_index=True)
-
-    st.subheader(f"🔮 Ramalan {n_forecast} Bulan ke Depan")
-    st.markdown(
-        f"Total: **{sum(hasil['hasil_forecast']):,} pemasangan** | "
-        f"Rata-rata: **{sum(hasil['hasil_forecast'])/n_forecast:.1f} pemasangan/bulan**"
+    st.markdown("")
+    tab_stat, tab_grafik, tab_tabel, tab_ramal, tab_download = st.tabs(
+        ["📊 Statistik", "📈 Grafik", "📋 Tabel", "🔮 Peramalan", "📥 Download"]
     )
 
-    st.pyplot(fig)
+    with tab_stat:
+        st.markdown("###### 🧹 Preprocessing")
+        for c in st.session_state.catatan_cleaning:
+            st.markdown(f"- {c}")
 
-    tab1, tab2, tab3 = st.tabs(["📅 Hasil Peramalan", "✅ Evaluasi Model (Test)", "📋 Tabel Perhitungan Lengkap"])
-    with tab1:
-        st.dataframe(hasil["df_forecast"], use_container_width=True, hide_index=True)
-    with tab2:
-        st.dataframe(hasil["df_eval"], use_container_width=True, hide_index=True)
-    with tab3:
-        st.dataframe(hasil["df_tabel"], use_container_width=True, hide_index=True)
+        st.markdown("###### 🗓️ Periode & Pembagian Data")
+        st.markdown(f"- {st.session_state.info_periode}")
+        st.markdown(f"- {st.session_state.info_split}")
 
-    if "tabel_mape" in hasil:
-        with st.expander("Tabel Optimasi Parameter (MAPE untuk 81 kombinasi α × γ)"):
-            st.dataframe(hasil["tabel_mape"].style.highlight_min(axis=None, color="#c6efce"),
-                         use_container_width=True)
+        st.markdown("###### Statistik Deskriptif Data Bulanan")
+        bulanan = st.session_state.bulanan
+        c1, c2, c3, c4 = st.columns(4)
+        render_stat_cards(
+            [c1, c2, c3, c4],
+            [
+                ("Minimum", f"{bulanan.min():,.0f}"),
+                ("Maksimum", f"{bulanan.max():,.0f}"),
+                ("Rata-rata", f"{bulanan.mean():,.1f}"),
+                ("Std Dev", f"{bulanan.std():,.1f}"),
+            ],
+        )
 
-    st.download_button(
-        label="⬇️ Download Hasil Lengkap (Excel)",
-        data=excel_bytes,
-        file_name=f"hasil_peramalan_{hasil['method_short'].replace(' ', '_').lower()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-else:
-    st.info("👈 Upload data, pilih metode, lalu klik **Jalankan Analisis** di sidebar untuk memulai.")
+        st.markdown("###### 🔍 Uji Stasioneritas (ADF)")
+        adf_stat, adf_pval, adf_kesimpulan = st.session_state.adf_info
+        st.markdown(f"ADF statistic = `{adf_stat:.4f}` | p-value = `{adf_pval:.4f}` — {adf_kesimpulan}")
+
+        if "tabel_kandidat" in hasil:
+            st.markdown("###### Perbandingan Kombinasi Holt-Winters")
+            st.dataframe(hasil["tabel_kandidat"], width='stretch', hide_index=True)
+
+    with tab_grafik:
+        st.markdown("###### Time Series Plot Data Aktual")
+        st.pyplot(st.session_state.fig_ts)
+        st.markdown("###### Fitted vs Aktual & Peramalan")
+        st.pyplot(st.session_state.fig_hasil)
+
+    with tab_tabel:
+        st.markdown("###### 📋 Tabel Perhitungan Lengkap")
+        st.dataframe(hasil["df_tabel"], width='stretch', hide_index=True)
+        st.markdown("###### ✅ Evaluasi Model (Data Test)")
+        st.dataframe(hasil["df_eval"], width='stretch', hide_index=True)
+        if "tabel_mape" in hasil:
+            with st.expander("Tabel Optimasi Parameter (MAPE untuk 81 kombinasi α × γ)"):
+                st.dataframe(hasil["tabel_mape"].style.highlight_min(axis=None, color="#c6efce"),
+                             width='stretch')
+
+    with tab_ramal:
+        n_forecast = st.session_state.n_forecast
+        st.markdown(f"###### 🔮 Ramalan {n_forecast} Bulan ke Depan")
+        st.markdown(
+            f"Total: **{sum(hasil['hasil_forecast']):,} pemasangan** | "
+            f"Rata-rata: **{sum(hasil['hasil_forecast'])/n_forecast:.1f} pemasangan/bulan**"
+        )
+        st.dataframe(hasil["df_forecast"], width='stretch', hide_index=True)
+        st.pyplot(st.session_state.fig_hasil)
+
+    with tab_download:
+        st.markdown("###### 📥 Download Hasil Lengkap")
+        st.download_button(
+            label="⬇️ Download Excel (semua tabel & ringkasan)",
+            data=st.session_state.excel_bytes,
+            file_name=f"hasil_peramalan_{hasil['method_short'].replace(' ', '_').lower()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width='stretch',
+        )
+
+        buf_ts = io.BytesIO()
+        st.session_state.fig_ts.savefig(buf_ts, format="png", dpi=150, bbox_inches="tight")
+        st.download_button(
+            "⬇️ Download Gambar Time Series (.png)", data=buf_ts.getvalue(),
+            file_name="time_series_plot.png", mime="image/png", width='stretch',
+        )
+
+        buf_hasil = io.BytesIO()
+        st.session_state.fig_hasil.savefig(buf_hasil, format="png", dpi=150, bbox_inches="tight")
+        st.download_button(
+            "⬇️ Download Gambar Hasil Peramalan (.png)", data=buf_hasil.getvalue(),
+            file_name="hasil_peramalan.png", mime="image/png", width='stretch',
+        )
+
+elif uploaded_file is None:
+    st.info("👈 Upload data, pilih metode, lalu klik **Jalankan** di sidebar untuk memulai.")
 
 st.markdown("---")
 st.caption(
     "Kedua metode dievaluasi dengan pendekatan train-test split (out-of-sample) sebelum "
-    "di-refit ke seluruh data untuk peramalan akhir. Bandingkan MAPE dari kedua metode "
-    "untuk menentukan mana yang lebih cocok untuk pola data kamu."
+    "di-refit ke seluruh data untuk peramalan akhir."
 )
